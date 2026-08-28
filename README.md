@@ -184,6 +184,17 @@ not pin the thread itself.
 size and the display each window is on. `ServerWindows()` is the same machine
 seen through `CGWindowListCopyWindowInfo`, which needs no grant.
 
+**Diagnosis.** `w.Role() (role, subrole string, err error)` and
+`w.Attributes() ([]string, error)`. An element that answers AXError **-25205**
+— *the element does not have that attribute* — will happily list the attributes
+it DOES have, and name its own role. Without that, a failed read of
+`kAXPosition` is a dead end: nothing in the error says whether the element is a
+window at all. That gap cost an hour of guessing once, and it is what these two
+close. Measured immediately: `kAXWindows` of **Finder** returns the desktop as
+an **`AXScrollArea`**, not a window — so an element in that list is not
+guaranteed to be movable, and a caller that cares should read the role rather
+than assume.
+
 **Moving.** `Move(w, rect, opts)` and `MoveToDisplay(w, display, displays, opts)`.
 The target is a **rectangle in global coordinates**, so the caller — which knows
 what a ribbon position means — decides, and this package does not have to.

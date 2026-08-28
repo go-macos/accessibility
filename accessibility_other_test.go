@@ -69,6 +69,12 @@ func TestStubWindow(t *testing.T) {
 	if _, err := w.Info(); !errors.Is(err, ErrUnsupported) {
 		t.Errorf("Info = %v", err)
 	}
+	if _, _, err := w.Role(); !errors.Is(err, ErrUnsupported) {
+		t.Errorf("Role = %v", err)
+	}
+	if _, err := w.Attributes(); !errors.Is(err, ErrUnsupported) {
+		t.Errorf("Attributes = %v", err)
+	}
 	if err := w.Close(); !errors.Is(err, ErrUnsupported) {
 		t.Errorf("Close = %v", err)
 	}

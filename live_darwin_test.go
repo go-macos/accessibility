@@ -579,3 +579,61 @@ func TestLiveAXAndTheWindowServerAgree(t *testing.T) {
 			agreed, compared, worst)
 	}
 }
+
+// TestLiveRoleAndAttributesSayWhatAnElementIs covers the diagnostic that was
+// missing the day an application answered kAXWindows with elements that had no
+// position: with only "the element does not have that attribute" to go on there
+// was no way to ask what the elements WERE, and an hour went into guessing.
+func TestLiveRoleAndAttributesSayWhatAnElementIs(t *testing.T) {
+	requireTrust(t)
+	pid, w := openTextEdit(t)
+	_ = pid
+
+	role, subrole, err := w.Role()
+	if err != nil {
+		t.Fatalf("Role: %v", err)
+	}
+	if role != "AXWindow" {
+		t.Errorf("role = %q, want AXWindow for a window TextEdit just opened", role)
+	}
+	t.Logf("role=%q subrole=%q", role, subrole)
+
+	attrs, err := w.Attributes()
+	if err != nil {
+		t.Fatalf("Attributes: %v", err)
+	}
+	if len(attrs) == 0 {
+		t.Fatal("Attributes returned nothing for a live window")
+	}
+	// Sorted, and carrying the two attributes every mover needs.
+	for i := 1; i < len(attrs); i++ {
+		if attrs[i-1] > attrs[i] {
+			t.Errorf("Attributes are not sorted: %q before %q", attrs[i-1], attrs[i])
+			break
+		}
+	}
+	need := map[string]bool{"AXPosition": false, "AXSize": false, "AXRole": false}
+	for _, a := range attrs {
+		if _, ok := need[a]; ok {
+			need[a] = true
+		}
+	}
+	for a, found := range need {
+		if !found {
+			t.Errorf("a live window does not list %s; it lists %v", a, attrs)
+		}
+	}
+	t.Logf("%d attributes: %v", len(attrs), attrs)
+
+	// A closed handle must answer, not crash: the diagnostic is most likely to
+	// be reached from an error path, where the handle's state is unknown.
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, _, err := w.Role(); !errors.Is(err, ErrClosed) {
+		t.Errorf("Role after Close = %v, want ErrClosed", err)
+	}
+	if _, err := w.Attributes(); !errors.Is(err, ErrClosed) {
+		t.Errorf("Attributes after Close = %v, want ErrClosed", err)
+	}
+}
