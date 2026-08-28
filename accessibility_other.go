@@ -141,3 +141,9 @@ func FocusedWindow() (*AXWindow, error) { return nil, ErrUnsupported }
 
 // ServerWindows reports [ErrUnsupported].
 func ServerWindows() ([]ServerWindow, error) { return nil, ErrUnsupported }
+
+// Role reports [ErrUnsupported].
+func (w *AXWindow) Role() (role, subrole string, err error) { return "", "", ErrUnsupported }
+
+// Attributes reports [ErrUnsupported].
+func (w *AXWindow) Attributes() ([]string, error) { return nil, ErrUnsupported }

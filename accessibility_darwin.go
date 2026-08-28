@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"unsafe"
@@ -69,6 +70,10 @@ var (
 	axUIElementCreateSystemWide   func() uintptr
 	axUIElementGetPid             func(el uintptr, out *int32) int32
 	axUIElementCopyAttributeValue func(el, attr uintptr, out *uintptr) int32
+	// axUIElementCopyAttributeNames lists the attribute names an element answers
+	// to. It is the only way to find out what an element IS when the attribute
+	// you wanted comes back unsupported.
+	axUIElementCopyAttributeNames func(el uintptr, out *uintptr) int32
 	axUIElementSetAttributeValue  func(el, attr, value uintptr) int32
 	axUIElementPerformAction      func(el, action uintptr) int32
 	axValueCreate                 func(typ int32, ptr unsafe.Pointer) uintptr
@@ -112,6 +117,8 @@ var (
 	strAXRaise            uintptr
 	strAXFocusedApp       uintptr
 	strAXFocusedWindow    uintptr
+	strAXRole             uintptr
+	strAXSubrole          uintptr
 	strCGWindowOwnerPID   uintptr
 	strCGWindowOwnerName  uintptr
 	strCGWindowName       uintptr
@@ -167,6 +174,7 @@ func load() error {
 		purego.RegisterLibFunc(&axUIElementCreateSystemWide, as, "AXUIElementCreateSystemWide")
 		purego.RegisterLibFunc(&axUIElementGetPid, as, "AXUIElementGetPid")
 		purego.RegisterLibFunc(&axUIElementCopyAttributeValue, as, "AXUIElementCopyAttributeValue")
+		purego.RegisterLibFunc(&axUIElementCopyAttributeNames, as, "AXUIElementCopyAttributeNames")
 		purego.RegisterLibFunc(&axUIElementSetAttributeValue, as, "AXUIElementSetAttributeValue")
 		purego.RegisterLibFunc(&axUIElementPerformAction, as, "AXUIElementPerformAction")
 		purego.RegisterLibFunc(&axValueCreate, as, "AXValueCreate")
@@ -202,6 +210,8 @@ func load() error {
 			strAXRaise = keep("AXRaise")
 			strAXFocusedApp = keep("AXFocusedApplication")
 			strAXFocusedWindow = keep("AXFocusedWindow")
+			strAXRole = keep("AXRole")
+			strAXSubrole = keep("AXSubrole")
 			strCGWindowOwnerPID = keep("kCGWindowOwnerPID")
 			strCGWindowOwnerName = keep("kCGWindowOwnerName")
 			strCGWindowName = keep("kCGWindowName")
@@ -891,4 +901,80 @@ func ServerWindows() ([]ServerWindow, error) {
 // every key read here.
 func numberFor(dict objc.ID, key uintptr) int64 {
 	return objc.Send[int64](dict.Send(objc.Sel("objectForKey:"), objc.ID(key)), objc.Sel("longLongValue"))
+}
+
+// Role returns the element's kAXRole and kAXSubrole — "AXWindow" and
+// "AXStandardWindow" for an ordinary window.
+//
+// It is a diagnostic, and it earns its place: when [AXWindow.Frame] reports that
+// the element has no kAXPositionAttribute, the only question worth asking is
+// what the element actually IS, and there was no way to ask it. An hour was
+// spent guessing at that once.
+func (w *AXWindow) Role() (role, subrole string, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.el == 0 {
+		return "", "", ErrClosed
+	}
+	role, err = copyStringAttr(w.el, strAXRole, "reading kAXRoleAttribute")
+	if err != nil {
+		return "", "", err
+	}
+	// A subrole is genuinely optional, and its absence is not a failure.
+	subrole, _ = copyStringAttr(w.el, strAXSubrole, "reading kAXSubroleAttribute")
+	return role, subrole, nil
+}
+
+// Attributes lists the attribute names the element answers to, sorted.
+//
+// This is the other half of [AXWindow.Role]: an element that reports
+// AXError -25205 for the attribute you asked for will happily list the ones it
+// has, which turns "the element does not have that attribute" from a dead end
+// into a fact about the application.
+func (w *AXWindow) Attributes() ([]string, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.el == 0 {
+		return nil, ErrClosed
+	}
+	var arr uintptr
+	if err := AXError(axUIElementCopyAttributeNames(w.el, &arr)).
+		Err("listing the element's attributes"); err != nil {
+		return nil, err
+	}
+	if arr == 0 {
+		return nil, nil
+	}
+	defer cfRelease(arr)
+	// An element with nothing to say can answer with something that is not an
+	// array, and CFArrayGetCount on that would take the process down.
+	if cfGetTypeID(arr) != cfArrayGetTypeID() {
+		return nil, nil
+	}
+	n := cfArrayGetCount(arr)
+	out := make([]string, 0, n)
+	pool(func() {
+		for i := int64(0); i < n; i++ {
+			if s := cfArrayGetValueAtIndex(arr, i); s != 0 {
+				out = append(out, objc.GoString(objc.ID(s)))
+			}
+		}
+	})
+	sort.Strings(out)
+	return out, nil
+}
+
+// copyStringAttr reads one CFString attribute of an element.
+func copyStringAttr(el, attr uintptr, op string) (string, error) {
+	var ref uintptr
+	if err := AXError(axUIElementCopyAttributeValue(el, attr, &ref)).Err(op); err != nil {
+		return "", err
+	}
+	if ref == 0 {
+		return "", fmt.Errorf("accessibility: %s: the attribute came back empty", op)
+	}
+	defer cfRelease(ref)
+	var s string
+	pool(func() { s = objc.GoString(objc.ID(ref)) })
+	return s, nil
 }
