@@ -310,14 +310,32 @@ func (p Placement) String() string {
 // would report a refusal for a move that plainly happened.
 const DefaultTolerance = 2.0
 
-// defaultAttempts is how many times [Move] will re-assert the position.
+// minAttempts is how many times [Move] writes the position before it starts
+// demanding progress.
 //
 // Two is not padding. Setting the size can move the origin — a window whose new
 // size no longer fits where it was put gets pushed back by the window server —
 // so the position is written, then the size, then the position again if the
-// read-back disagrees. A third attempt has never changed an outcome that the
-// second did not.
-const defaultAttempts = 2
+// read-back disagrees.
+const minAttempts = 2
+
+// maxAttempts is the ceiling on that loop.
+//
+// It used to be 2, with a comment saying a third attempt had never changed an
+// outcome. That was WRONG, and measuring it was the whole point: a window too
+// big for its destination is not refused by the window server, it is moved ONE
+// DISPLAY CLOSER PER WRITE. Thunderbird, 1922 points wide, sent to the far end
+// of a six-screen ribbon on macOS 26.6.2:
+//
+//	write 1  -> -1882   distance 9638
+//	write 2  -> -3802   distance 7718
+//	...
+//	write 6  -> -11520  distance 0      ARRIVED
+//
+// So [Move] keeps writing while each write brings the window closer, and stops
+// the moment one does not. The ceiling is a backstop against an application
+// that oscillates, not a budget: an ordinary move arrives on the first write.
+const maxAttempts = 16
 
 // Options tunes [Move] and [MoveToDisplay]. The zero value is the sensible
 // default: [Relative] placement, no inset, clamped to the target display,
@@ -533,12 +551,43 @@ func Move(w Window, want Rect, opts *Options) (Result, error) {
 	}
 	res := Result{Before: before, Wanted: want, Got: before}
 
-	for attempt := 1; attempt <= defaultAttempts; attempt++ {
+	// closest is the smallest distance to the target seen so far. A write that
+	// does not improve on it is a write that will never arrive.
+	closest := offBy(res.Got, want)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		res.Attempts = attempt
+		wrongSize := !near(res.Got.W, want.W, tol) || !near(res.Got.H, want.H, tol)
+		// SHRINK BEFORE MOVING; GROW AFTER.
+		//
+		// The window server clamps a move that would put the window outside
+		// the displays, and it judges by the size the window has AT THE MOMENT
+		// OF THE WRITE. So a window wider than where it is going must be shrunk
+		// first, or the move is silently corrected to something nobody asked
+		// for. Measured on macOS 26.6.2, a 2056x1083 Thunderbird window sent to
+		// fill a 1920x1080 screen at -9600,0:
+		//
+		//	position, then size -> 2040x1049 at -2016,40   (clamped, useless)
+		//	size, then position -> 1920x1049 at -9600,31   (arrived)
+		//
+		// Growing is the other way round: a window told to grow where it
+		// stands can be clamped there, so the position goes first and the
+		// growth happens at the destination.
+		//
+		// The TOLERANCE HAS NO PART IN THIS. It says how close is close enough
+		// to call a move done; it says nothing about whether the window FITS.
+		// Measured: a window TWO points wider than its destination — inside the
+		// default tolerance of 2 — was still clamped 11520 points away, because
+		// the window server does not round in anyone's favour.
+		tooBig := res.Got.W > want.W || res.Got.H > want.H
+		if wrongSize && tooBig {
+			if err := w.SetSize(want.Size()); err != nil {
+				return res, fmt.Errorf("accessibility: setting the size: %w", err)
+			}
+		}
 		if err := w.SetPosition(want.Origin()); err != nil {
 			return res, fmt.Errorf("accessibility: setting the position: %w", err)
 		}
-		if !near(res.Got.W, want.W, tol) || !near(res.Got.H, want.H, tol) {
+		if wrongSize && !tooBig {
 			if err := w.SetSize(want.Size()); err != nil {
 				return res, fmt.Errorf("accessibility: setting the size: %w", err)
 			}
@@ -552,6 +601,16 @@ func Move(w Window, want Rect, opts *Options) (Result, error) {
 		res.Resized = near(got.W, want.W, tol) && near(got.H, want.H, tol)
 		if res.Moved && res.Resized {
 			break
+		}
+		// Stop as soon as a write stops helping. The first minAttempts are
+		// spent regardless, because setting the size can push the origin back
+		// and the second write is what puts it right.
+		d := offBy(got, want)
+		if attempt >= minAttempts && d >= closest-math.Max(tol, 1) {
+			break
+		}
+		if d < closest {
+			closest = d
 		}
 	}
 	if res.Moved && opts.raise() {
@@ -821,4 +880,10 @@ func (e AXError) Err(op string) error {
 	default:
 		return fmt.Errorf("accessibility: %s: %w", op, e)
 	}
+}
+
+// offBy is how far a window is from where it was told to go: the larger of the
+// two axes, which is the quantity a write has to reduce to be making progress.
+func offBy(got, want Rect) float64 {
+	return math.Max(math.Abs(got.X-want.X), math.Abs(got.Y-want.Y))
 }
