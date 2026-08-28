@@ -31,6 +31,26 @@ type fakeWindow struct {
 	// nudgeOnce applies the nudge on the first size write only, so the
 	// second attempt succeeds — the ordinary two-attempt case.
 	nudgeOnce bool
+	// clampTo is the destination the window must FIT INSIDE for a position
+	// write to take effect. Zero means anywhere.
+	//
+	// It is a deliberately minimal stand-in for something measured on macOS
+	// 26.6.2 and not fully characterised: a move is silently corrected when
+	// the window is bigger than where it is going, judged by the size the
+	// window has AT THE MOMENT OF THE WRITE. A 2056x1083 window sent to fill
+	// a 1920x1080 screen at -9600,0 ended up at -2016,40 with the wrong size
+	// when the position went first, and at -9600,31 with the right size when
+	// the size went first. What is modelled here is only the part the fix
+	// turns on: the position write DEPENDS on the current size.
+	clampTo Rect
+	// walk limits how far one position write may actually move the window,
+	// standing in for the window server moving a window that does not fit its
+	// destination ONE DISPLAY CLOSER PER WRITE. Measured: six writes to cross
+	// six 1920-point screens.
+	walk float64
+	// writes records every write in order, "pos" or "size", which is the
+	// whole point of some tests: the ORDER is the fix.
+	writes []string
 
 	frameErr    error
 	frameErrAt  int // fail on the Nth Frame call (1-based); 0 means every call
@@ -57,8 +77,20 @@ func (f *fakeWindow) SetPosition(p Point) error {
 		return f.posErr
 	}
 	f.positionSet++
+	f.writes = append(f.writes, "pos")
+	was := f.frame
 	if !f.pin {
-		f.frame.X, f.frame.Y = p.X, p.Y
+		switch {
+		case f.walk > 0:
+			f.frame.X += step(p.X-f.frame.X, f.walk)
+			f.frame.Y += step(p.Y-f.frame.Y, f.walk)
+		default:
+			f.frame.X, f.frame.Y = p.X, p.Y
+		}
+		if (f.clampTo != Rect{}) && (f.frame.W > f.clampTo.W || f.frame.H > f.clampTo.H) {
+			// Too big to fit: the write is corrected away.
+			f.frame.X, f.frame.Y = was.X, was.Y
+		}
 	}
 	return nil
 }
@@ -68,6 +100,7 @@ func (f *fakeWindow) SetSize(s Size) error {
 		return f.sizeErr
 	}
 	f.sizeSet++
+	f.writes = append(f.writes, "size")
 	f.sizesWanted = append(f.sizesWanted, s)
 	if !f.pin && !f.pinSize {
 		f.frame.W, f.frame.H = s.W, s.H
@@ -527,8 +560,8 @@ func TestMoveCatchesAWindowThatDoesNotMove(t *testing.T) {
 	if res.Got != res.Before {
 		t.Errorf("Got = %v, want the unchanged %v", res.Got, res.Before)
 	}
-	if w.positionSet != defaultAttempts {
-		t.Errorf("gave up after %d position writes, want %d", w.positionSet, defaultAttempts)
+	if w.positionSet != minAttempts {
+		t.Errorf("gave up after %d position writes, want %d", w.positionSet, minAttempts)
 	}
 	// A refused move must NOT raise: bringing a window forward that is
 	// still on the wrong display is worse than leaving it alone.
@@ -551,8 +584,8 @@ func TestMoveSucceedsWhenOnlyTheSizeIsRefused(t *testing.T) {
 	if !res.Moved || res.Resized {
 		t.Errorf("Result = %+v, want Moved && !Resized", res)
 	}
-	if res.Attempts != defaultAttempts {
-		t.Errorf("Attempts = %d, want %d (it retries while the size is wrong)", res.Attempts, defaultAttempts)
+	if res.Attempts != minAttempts {
+		t.Errorf("Attempts = %d, want %d (it retries while the size is wrong)", res.Attempts, minAttempts)
 	}
 	if !strings.Contains(res.String(), "size refused") {
 		t.Errorf("Result.String does not mention the refused size: %q", res.String())
@@ -869,3 +902,171 @@ func TestAXErrorErr(t *testing.T) {
 // that a consumer's own code compiles unchanged on both.
 var _ Window = (*AXWindow)(nil)
 var _ Window = (*fakeWindow)(nil)
+
+// ---------------------------------------------------------------------------
+// The order of the two writes.
+// ---------------------------------------------------------------------------
+
+// TestMoveShrinksBeforeMovingAWindowTooBigForItsDestination is the portable
+// form of a failure measured on a real machine: a 2056x1083 window sent to fill
+// a 1920x1080 screen at -9600,0 landed at -2016,40 instead, because the window
+// server clamps a move by the size the window has AT THE MOMENT of the write.
+//
+// The fake clamps the same way, over a display union spanning -11520..2056.
+func TestMoveShrinksBeforeMovingAWindowTooBigForItsDestination(t *testing.T) {
+	screen := Rect{X: -11520, Y: 0, W: 1920, H: 1080}
+	w := &fakeWindow{frame: Rect{X: 0, Y: 101, W: 2056, H: 1083}, clampTo: screen}
+	want := Rect{X: -11520, Y: 0, W: 1920, H: 1080}
+
+	res, err := Move(w, want, &Options{NoRaise: true})
+	if err != nil {
+		t.Fatalf("Move: %v (result %s)", err, res)
+	}
+	if res.Got != want {
+		t.Errorf("landed at %s, wanted %s", res.Got, want)
+	}
+	// The order is the fix, so the order is what is asserted.
+	if len(w.writes) < 2 || w.writes[0] != "size" || w.writes[1] != "pos" {
+		t.Errorf("writes were %v, want the size first and the position second", w.writes)
+	}
+	if res.Attempts != 1 {
+		t.Errorf("took %d attempts; shrinking first should land it on the first", res.Attempts)
+	}
+}
+
+// TestMoveWithTheOldOrderWouldHaveBeenClamped is the negative control for the
+// test above: the same fake, the same clamp, with the writes in the ORDER THE
+// CODE USED TO USE. It must fail to arrive — otherwise the test above proves
+// nothing about the order.
+func TestMoveWithTheOldOrderWouldHaveBeenClamped(t *testing.T) {
+	want := Rect{X: -11520, Y: 0, W: 1920, H: 1080}
+	w := &fakeWindow{frame: Rect{X: 0, Y: 101, W: 2056, H: 1083}, clampTo: want}
+
+	// Position first, size second — by hand, since the code no longer does it.
+	_ = w.SetPosition(want.Origin())
+	_ = w.SetSize(want.Size())
+	got, _ := w.Frame()
+	if got.X == want.X {
+		t.Fatal("the old order arrived; the model has no teeth and the test above proves nothing")
+	}
+	// The shape of the real failure: right size, wrong place.
+	if got.W != want.W || got.H != want.H {
+		t.Errorf("size = %gx%g, want %gx%g", got.W, got.H, want.W, want.H)
+	}
+	t.Logf("old order left the window at %g,%g instead of %g,%g", got.X, got.Y, want.X, want.Y)
+}
+
+// TestMoveGrowsAfterMovingWhenTheWindowIsSmaller checks the other direction:
+// a window smaller than its destination is moved FIRST and grown there, because
+// growing where it stands is what gets clamped.
+func TestMoveGrowsAfterMovingWhenTheWindowIsSmaller(t *testing.T) {
+	screen := Rect{X: -11520, Y: 0, W: 1920, H: 1080}
+	w := &fakeWindow{frame: Rect{X: 1000, Y: 100, W: 400, H: 300}, clampTo: screen}
+	want := Rect{X: -11520, Y: 0, W: 1920, H: 1080}
+
+	res, err := Move(w, want, &Options{NoRaise: true})
+	if err != nil {
+		t.Fatalf("Move: %v (result %s)", err, res)
+	}
+	if res.Got != want {
+		t.Errorf("landed at %s, wanted %s", res.Got, want)
+	}
+	if len(w.writes) < 2 || w.writes[0] != "pos" || w.writes[1] != "size" {
+		t.Errorf("writes were %v, want the position first and the size second", w.writes)
+	}
+}
+
+// TestMoveDoesNotTouchTheSizeWhenItIsAlreadyRight guards the third case: no
+// size write at all, whichever way round the code is.
+func TestMoveDoesNotTouchTheSizeWhenItIsAlreadyRight(t *testing.T) {
+	w := &fakeWindow{frame: Rect{X: 500, Y: 500, W: 1920, H: 1080}}
+	want := Rect{X: -1920, Y: 0, W: 1920, H: 1080}
+
+	if _, err := Move(w, want, &Options{NoRaise: true}); err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	if w.sizeSet != 0 {
+		t.Errorf("wrote the size %d times for a window already the right size", w.sizeSet)
+	}
+	if fmt.Sprint(w.writes) != "[pos]" {
+		t.Errorf("writes were %v, want just the position", w.writes)
+	}
+}
+
+// TestMoveReportsAFailedShrink covers the write that only exists on the
+// shrink-first path: the size is written BEFORE the position there, so its
+// error has to be reported from there too.
+func TestMoveReportsAFailedShrink(t *testing.T) {
+	boom := errors.New("boom")
+	w := &fakeWindow{frame: Rect{X: 0, Y: 0, W: 3000, H: 2000}, sizeErr: boom}
+
+	res, err := Move(w, Rect{X: -1920, Y: 0, W: 1920, H: 1080}, &Options{NoRaise: true})
+	if !errors.Is(err, boom) {
+		t.Fatalf("Move err = %v, want the size error", err)
+	}
+	if !strings.Contains(err.Error(), "setting the size") {
+		t.Errorf("err = %q, want it to say which write failed", err)
+	}
+	// Nothing was moved, and the report says so rather than guessing.
+	if w.positionSet != 0 {
+		t.Errorf("wrote the position %d times after the shrink failed", w.positionSet)
+	}
+	if res.Moved {
+		t.Error("Moved is true after a failed shrink")
+	}
+}
+
+// step moves at most limit towards a delta, keeping its sign.
+func step(delta, limit float64) float64 {
+	if delta > limit {
+		return limit
+	}
+	if delta < -limit {
+		return -limit
+	}
+	return delta
+}
+
+// TestMoveKeepsWritingWhileTheWindowGetsCloser is the portable form of the
+// measurement that killed the old fixed count of two attempts: a window the
+// window server moves one display closer per write arrives on the sixth, across
+// a six-screen ribbon.
+func TestMoveKeepsWritingWhileTheWindowGetsCloser(t *testing.T) {
+	w := &fakeWindow{frame: Rect{X: 0, Y: 0, W: 1922, H: 1049}, walk: 1920}
+	want := Rect{X: -11520, Y: 0, W: 1922, H: 1049}
+
+	res, err := Move(w, want, &Options{NoRaise: true})
+	if err != nil {
+		t.Fatalf("Move: %v (result %s)", err, res)
+	}
+	if res.Got.X != want.X {
+		t.Errorf("landed at %g, wanted %g", res.Got.X, want.X)
+	}
+	if res.Attempts != 6 {
+		t.Errorf("Attempts = %d, want 6: one write per display crossed", res.Attempts)
+	}
+	if w.sizeSet != 0 {
+		t.Errorf("wrote the size %d times for a window already the right size", w.sizeSet)
+	}
+}
+
+// TestMoveStopsAtTheCeilingWhenEveryWriteHelpsALittle is the other end of the
+// same rule: a window that keeps getting closer and never arrives must stop at
+// the ceiling and report a refusal, not spin.
+func TestMoveStopsAtTheCeilingWhenEveryWriteHelpsALittle(t *testing.T) {
+	// Three points closer per write, ten thousand to go: every write helps,
+	// none of them arrives.
+	w := &fakeWindow{frame: Rect{X: 0, Y: 0, W: 800, H: 600}, walk: 3}
+	want := Rect{X: -10000, Y: 0, W: 800, H: 600}
+
+	res, err := Move(w, want, &Options{NoRaise: true})
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("Move err = %v, want ErrRefused", err)
+	}
+	if res.Attempts != maxAttempts {
+		t.Errorf("Attempts = %d, want the ceiling %d", res.Attempts, maxAttempts)
+	}
+	if res.Moved {
+		t.Error("Moved is true for a window that never arrived")
+	}
+}
