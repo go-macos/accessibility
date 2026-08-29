@@ -637,3 +637,54 @@ func TestLiveRoleAndAttributesSayWhatAnElementIs(t *testing.T) {
 		t.Errorf("Attributes after Close = %v, want ErrClosed", err)
 	}
 }
+
+// TestLiveEveryWindowReallyIsAWindow, on this machine, for every application
+// that will answer.
+//
+// kAXWindows is not a list of windows. The Finder answers it with its DESKTOP —
+// an AXScrollArea covering every display: 19336x2529 at -17280,-1200 here — and
+// a caller that moves what this returns then tries to move the desktop. It
+// fails after two attempts and reports "the window did not move where it was
+// told", which is an accusation aimed at something that was never a window.
+//
+// Seen in go-xrkit/desk's own log, placing applications on a ribbon.
+func TestLiveEveryWindowReallyIsAWindow(t *testing.T) {
+	requireLive(t)
+
+	apps, err := Applications()
+	if err != nil {
+		t.Fatalf("Applications: %v", err)
+	}
+	var checked int
+	for _, a := range apps {
+		ws, err := WindowsOf(a.PID, a.Name)
+		if err != nil {
+			continue // an application AX will not describe is not this test's business
+		}
+		for _, w := range ws {
+			role, sub, err := w.Role()
+			if err != nil {
+				w.Close()
+				continue
+			}
+			checked++
+			if role != RoleWindow {
+				t.Errorf("%s handed back a %s (%s) as a window: %s", a.Name, role, sub, frameOf(w))
+			}
+			w.Close()
+		}
+	}
+	if checked == 0 {
+		t.Skip("nothing on this machine answered with a window")
+	}
+	t.Logf("%d windows across %d applications, every one an %s", checked, len(apps), RoleWindow)
+}
+
+// frameOf is for the message.
+func frameOf(w *AXWindow) string {
+	f, err := w.Frame()
+	if err != nil {
+		return "unreadable"
+	}
+	return f.String()
+}
