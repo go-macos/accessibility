@@ -887,3 +887,11 @@ func (e AXError) Err(op string) error {
 func offBy(got, want Rect) float64 {
 	return math.Max(math.Abs(got.X-want.X), math.Abs(got.Y-want.Y))
 }
+
+// RoleWindow is what an element that really is a window answers to
+// kAXRoleAttribute.
+//
+// It is exported because it is the difference between a window and the DESKTOP:
+// the Finder answers kAXWindows with an AXScrollArea covering every display, and
+// a caller that treats the contents of that list as windows will try to move it.
+const RoleWindow = "AXWindow"

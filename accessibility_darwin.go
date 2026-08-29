@@ -692,6 +692,21 @@ func WindowsOf(pid int, appName string) ([]*AXWindow, error) {
 			if el == 0 {
 				continue
 			}
+			// kAXWindows is not a list of WINDOWS.
+			//
+			// The Finder answers it with its DESKTOP -- an AXScrollArea
+			// spanning every display: 19336x2529 at -17280,-1200 on the
+			// machine this was measured on. A caller that moves what this
+			// returns then tries to move the desktop, which fails after two
+			// attempts and reports a window that would not go where it was
+			// told -- an accusation aimed at something that was never a
+			// window.
+			//
+			// So the ROLE decides. An element that does not say AXWindow is
+			// not one, whatever list it arrived in.
+			if role, _ := copyStringAttr(el, strAXRole, "reading kAXRoleAttribute"); role != RoleWindow {
+				continue
+			}
 			w := &AXWindow{app: cfRetain(app), el: cfRetain(el), pid: pid, appName: appName}
 			var titleRef uintptr
 			if AXError(axUIElementCopyAttributeValue(el, strAXTitle, &titleRef)) == AXSuccess && titleRef != 0 {
