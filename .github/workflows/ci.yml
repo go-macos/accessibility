@@ -18,7 +18,7 @@ jobs:
     name: workflows parse
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: actionlint
         run: |
           bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
@@ -28,8 +28,8 @@ jobs:
     name: gofmt + tidy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - name: gofmt
@@ -54,8 +54,8 @@ jobs:
     name: darwin (CGO=0, real AX bindings)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - run: CGO_ENABLED=0 go vet ./...
@@ -92,8 +92,8 @@ jobs:
     name: linux (stubs + 100% coverage)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - run: CGO_ENABLED=0 go test -count=1 ./...
@@ -110,8 +110,8 @@ jobs:
     name: windows (stubs)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - run: go test -count=1 ./...
@@ -141,8 +141,8 @@ jobs:
           - { goos: darwin, goarch: arm64 }
           - { goos: freebsd, goarch: amd64 }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build ./...
@@ -167,8 +167,8 @@ jobs:
           - { goarch: ppc64le, qemu: qemu-ppc64le-static, qemu_cpu: power10 }
           - { goarch: s390x, qemu: qemu-s390x-static, qemu_cpu: "" }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - name: Install qemu-user
