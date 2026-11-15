@@ -15,6 +15,8 @@ type Path []int
 type SnapshotLimits struct {
 	MaxDepth int
 	MaxNodes int
+	// RedactEditable withholds every editable control's value.
+	RedactEditable bool
 }
 
 // Key codes for [PressKey].
@@ -73,3 +75,12 @@ func TypeText(int, string, time.Duration) error { return ErrUnsupported }
 
 // PressKey reports [ErrUnsupported].
 func PressKey(int, uint16) error { return ErrUnsupported }
+
+// Frame reports [ErrUnsupported].
+func (e *Element) Frame() (Rect, error) { return Rect{}, ErrUnsupported }
+
+// ClickAt reports [ErrUnsupported].
+func ClickAt(int, Point, int) error { return ErrUnsupported }
+
+// Click reports [ErrUnsupported].
+func (e *Element) Click(int, int) error { return ErrUnsupported }

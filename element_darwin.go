@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 	"unicode/utf16"
+	"unsafe"
 
 	"github.com/ebitengine/purego"
 	"github.com/go-macos/objc"
@@ -22,12 +23,15 @@ var (
 
 	strAXChildren, strAXValue, strAXDescription, strAXIdentifier, strAXPress, strAXFocused uintptr
 
-	cfStringGetTypeID          func() uint64
-	cgEventCreateKeyboardEvent func(source uintptr, key uint16, down bool) uintptr
-	cgEventKeyboardSetUnicode  func(ev uintptr, n uint64, chars *uint16)
-	cgEventSetFlags            func(ev uintptr, flags uint64)
-	cgEventPostToPid           func(pid int32, ev uintptr)
-	numberNo                   uintptr
+	cfStringGetTypeID           func() uint64
+	cgEventCreateKeyboardEvent  func(source uintptr, key uint16, down bool) uintptr
+	cgEventKeyboardSetUnicode   func(ev uintptr, n uint64, chars *uint16)
+	cgEventSetFlags             func(ev uintptr, flags uint64)
+	cgEventPostToPid            func(pid int32, ev uintptr)
+	cgEventPost                 func(tap uint32, ev uintptr)
+	cgEventCreateMouseEvent     func(source uintptr, typ uint32, pos cgPoint, button uint32) uintptr
+	cgEventSetIntegerValueField func(ev uintptr, field uint32, v int64)
+	numberNo                    uintptr
 )
 
 func loadElement() error {
@@ -45,6 +49,9 @@ func loadElement() error {
 		purego.RegisterLibFunc(&cgEventKeyboardSetUnicode, as, "CGEventKeyboardSetUnicodeString")
 		purego.RegisterLibFunc(&cgEventSetFlags, as, "CGEventSetFlags")
 		purego.RegisterLibFunc(&cgEventPostToPid, as, "CGEventPostToPid")
+		purego.RegisterLibFunc(&cgEventPost, as, "CGEventPost")
+		purego.RegisterLibFunc(&cgEventCreateMouseEvent, as, "CGEventCreateMouseEvent")
+		purego.RegisterLibFunc(&cgEventSetIntegerValueField, as, "CGEventSetIntegerValueField")
 		pool(func() {
 			keep := func(s string) uintptr { return cfRetain(uintptr(objc.NSString(s))) }
 			strAXChildren = keep("AXChildren")
@@ -176,6 +183,16 @@ type SnapshotLimits struct {
 	MaxDepth int
 	// MaxNodes is the most elements copied. Zero means 5000.
 	MaxNodes int
+	// RedactEditable withholds the value of every editable control
+	// (AXTextField, AXTextArea, AXComboBox), not only of the ones that say
+	// they are secure. Toolkits do not always set the secure subrole on a
+	// password field (Qt's does not here), so a dump taken while a secret is
+	// typed must set this.
+	RedactEditable bool
+}
+
+func editable(role string) bool {
+	return role == "AXTextField" || role == "AXTextArea" || role == "AXComboBox" || role == "AXSecureTextField"
 }
 
 // Snapshot copies the element and its descendants into a [Node] tree. Secure
@@ -188,16 +205,17 @@ func (e *Element) Snapshot(lim SnapshotLimits) (*Node, error) {
 		lim.MaxNodes = 5000
 	}
 	budget := lim.MaxNodes
-	return e.snapshot(0, lim.MaxDepth, &budget)
+	return e.snapshot(0, lim, &budget)
 }
 
-func (e *Element) snapshot(depth, maxDepth int, budget *int) (*Node, error) {
+func (e *Element) snapshot(depth int, lim SnapshotLimits, budget *int) (*Node, error) {
+	maxDepth := lim.MaxDepth
 	*budget--
 	n := &Node{
 		Role: e.Role(), Subrole: e.Subrole(), Title: e.Title(),
 		Description: e.Description(), Identifier: e.Identifier(),
 	}
-	n.Secure = n.Subrole == SecureSubrole
+	n.Secure = n.Subrole == SecureSubrole || (lim.RedactEditable && editable(n.Role))
 	if !n.Secure {
 		n.Value = e.str(strAXValue)
 	}
@@ -210,7 +228,7 @@ func (e *Element) snapshot(depth, maxDepth int, budget *int) (*Node, error) {
 	}
 	for _, k := range kids {
 		if *budget > 0 {
-			c, _ := k.snapshot(depth+1, maxDepth, budget)
+			c, _ := k.snapshot(depth+1, lim, budget)
 			n.Children = append(n.Children, *c)
 		}
 		_ = k.Close()
@@ -369,4 +387,70 @@ func PressKey(pid int, code uint16) error {
 		cfRelease(ev)
 	}
 	return nil
+}
+
+// Frame reads the element's position and size in global display coordinates.
+func (e *Element) Frame() (Rect, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.el == 0 {
+		return Rect{}, ErrClosed
+	}
+	var p cgPoint
+	var s cgSize
+	if err := readAXValue(e.el, strAXPosition, axValueTypeCGPoint, unsafe.Pointer(&p), "reading kAXPositionAttribute"); err != nil {
+		return Rect{}, err
+	}
+	if err := readAXValue(e.el, strAXSize, axValueTypeCGSize, unsafe.Pointer(&s), "reading kAXSizeAttribute"); err != nil {
+		return Rect{}, err
+	}
+	return Rect{p.X, p.Y, s.W, s.H}, nil
+}
+
+// Mouse event constants (CGEventType, CGMouseButton, CGEventField).
+const (
+	cgEventLeftMouseDown uint32 = 1
+	cgEventLeftMouseUp   uint32 = 2
+	cgMouseButtonLeft    uint32 = 0
+	cgMouseEventClickSt  uint32 = 1
+)
+
+// ClickAt posts a left click of count clicks (2 for a double click) at the
+// global point p to the process pid. The point must be over a visible part of
+// the target's window; the click is delivered to pid only, but the pointer is
+// not moved on screen.
+func ClickAt(pid int, p Point, count int) error {
+	if err := loadElement(); err != nil {
+		return err
+	}
+	if count < 1 {
+		count = 1
+	}
+	pos := cgPoint{p.X, p.Y}
+	for i := 1; i <= count; i++ {
+		for _, typ := range []uint32{cgEventLeftMouseDown, cgEventLeftMouseUp} {
+			ev := cgEventCreateMouseEvent(0, typ, pos, cgMouseButtonLeft)
+			if ev == 0 {
+				return fmt.Errorf("accessibility: CGEventCreateMouseEvent returned nothing")
+			}
+			cgEventSetIntegerValueField(ev, cgMouseEventClickSt, int64(i))
+			if pid <= 0 {
+				cgEventPost(0, ev) // kCGHIDEventTap: whatever is under the point
+			} else {
+				cgEventPostToPid(int32(pid), ev)
+			}
+			cfRelease(ev)
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	return nil
+}
+
+// Click clicks the centre of the element (count 2 = double click) in process pid.
+func (e *Element) Click(pid, count int) error {
+	f, err := e.Frame()
+	if err != nil {
+		return err
+	}
+	return ClickAt(pid, f.Center(), count)
 }
