@@ -221,6 +221,27 @@ AX anywhere in sight. That is where the negative control lives that no Mac is
 needed for: a fake window that accepts every write and does not move, which is
 precisely what AX hands you for a pinned window.
 
+### Driving another application's UI
+
+For testing an application that has no scripting interface (a Qt app, say),
+the package also reads and operates the AX tree:
+
+- `ApplicationElement(pid)` gives an `Element`: `Role`, `Subrole`, `Title`,
+  `Value`, `Description`, `Identifier`, `Children`, `Frame`, `SetValue`, `Press`,
+  `Focus`, `Click`.
+- `Element.Snapshot` copies a subtree into a detached `Node` that is searched
+  (`Find`, `FindRole`, `Texts`) and printed (`Render`) on any platform. **A
+  secure field's value is never copied out of the process, and `Render` prints
+  `<redacted>` in its place.** Toolkits do not always set the secure subrole
+  (Qt's password field does not), so `SnapshotLimits.RedactEditable` withholds
+  every editable control's value; set it for any dump taken while a secret is
+  typed.
+- `TypeText` and `PressKey` post keyboard events to a process (`CGEventPostToPid`),
+  for fields that refuse `SetValue`. `ClickAt(0, ...)` posts a click to the
+  screen, so it lands on whatever window is on top at that point: check the
+  top window first (`ServerWindows`) before using it on another application.
+  The grant is the same Accessibility one as for moving windows.
+
 ## Verification
 
 **The move is proved by two instruments, neither of which performed the write.**
