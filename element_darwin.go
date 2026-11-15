@@ -31,7 +31,6 @@ var (
 	cgEventPost                 func(tap uint32, ev uintptr)
 	cgEventCreateMouseEvent     func(source uintptr, typ uint32, pos cgPoint, button uint32) uintptr
 	cgEventSetIntegerValueField func(ev uintptr, field uint32, v int64)
-	numberNo                    uintptr
 )
 
 func loadElement() error {
@@ -60,7 +59,6 @@ func loadElement() error {
 			strAXIdentifier = keep("AXIdentifier")
 			strAXPress = keep("AXPress")
 			strAXFocused = keep("AXFocused")
-			numberNo = cfRetain(uintptr(objc.ClassID("NSNumber").Send(objc.Sel("numberWithBool:"), false)))
 		})
 	})
 	return elemErr
@@ -100,9 +98,17 @@ func (e *Element) Close() error {
 // stringAttr reads an attribute as text: a CFString verbatim, anything else
 // (number, boolean, AXValue) by its description. A missing attribute is "".
 func stringAttr(el, attr uintptr) string {
+	s, _ := attrString(el, attr)
+	return s
+}
+
+// attrString is stringAttr with the AX status, so a caller deciding whether a
+// field is secret can tell "has no such attribute" from "could not be read".
+func attrString(el, attr uintptr) (string, AXError) {
 	var ref uintptr
-	if AXError(axUIElementCopyAttributeValue(el, attr, &ref)) != AXSuccess || ref == 0 {
-		return ""
+	st := AXError(axUIElementCopyAttributeValue(el, attr, &ref))
+	if st != AXSuccess || ref == 0 {
+		return "", st
 	}
 	defer cfRelease(ref)
 	var s string
@@ -113,28 +119,54 @@ func stringAttr(el, attr uintptr) string {
 			s = objc.GoString(objc.ID(objc.ID(ref).Send(objc.Sel("description"))))
 		}
 	})
-	return s
+	return s, AXSuccess
 }
 
-// Role, Subrole, Title, Value, Description and Identifier read one attribute;
-// an element that has no such attribute answers "". A secure field's Value is
-// always refused: use [Element.Secure] and [Element.SetValue].
+// secureLocked reports whether the element is, or may be, a password field.
+// FAIL CLOSED: if its role or subrole cannot be read (a busy application
+// answers kAXErrorCannotComplete), it counts as secure; only "no such
+// attribute" and "no value" count as a plain answer.
+func secureLocked(el uintptr) bool {
+	for _, a := range []uintptr{strAXRole, strAXSubrole} {
+		s, st := attrString(el, a)
+		if st != AXSuccess && st != AXNoValue && st != AXAttributeUnsupported {
+			return true
+		}
+		if s == SecureSubrole {
+			return true
+		}
+	}
+	return false
+}
+
+// Role, Subrole, Title, Description and Identifier read one attribute; an
+// element that has no such attribute answers "".
 func (e *Element) Role() string        { return e.str(strAXRole) }
 func (e *Element) Subrole() string     { return e.str(strAXSubrole) }
 func (e *Element) Title() string       { return e.str(strAXTitle) }
 func (e *Element) Description() string { return e.str(strAXDescription) }
 func (e *Element) Identifier() string  { return e.str(strAXIdentifier) }
 
-// Value reads kAXValue, or "" for a secure text field.
+// Value reads kAXValue, or "" for an element that is, or may be, a secure text
+// field (see [Element.Secure]). It does NOT know about toolkits that give a
+// password field no secure subrole (Qt's): for those, never print Value; use
+// [Element.Snapshot] with RedactEditable for anything that is shown or logged.
 func (e *Element) Value() string {
-	if e.Secure() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.el == 0 || secureLocked(e.el) {
 		return ""
 	}
-	return e.str(strAXValue)
+	return stringAttr(e.el, strAXValue)
 }
 
-// Secure reports whether the element is a password field.
-func (e *Element) Secure() bool { return e.Subrole() == SecureSubrole }
+// Secure reports whether the element is a password field, or could not be
+// read well enough to say it is not.
+func (e *Element) Secure() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.el != 0 && secureLocked(e.el)
+}
 
 func (e *Element) str(attr uintptr) string {
 	e.mu.Lock()
@@ -205,6 +237,12 @@ func (e *Element) Snapshot(lim SnapshotLimits) (*Node, error) {
 		lim.MaxNodes = 5000
 	}
 	budget := lim.MaxNodes
+	e.mu.Lock()
+	closed := e.el == 0
+	e.mu.Unlock()
+	if closed {
+		return nil, ErrClosed
+	}
 	return e.snapshot(0, lim, &budget)
 }
 
@@ -215,11 +253,11 @@ func (e *Element) snapshot(depth int, lim SnapshotLimits, budget *int) (*Node, e
 		Role: e.Role(), Subrole: e.Subrole(), Title: e.Title(),
 		Description: e.Description(), Identifier: e.Identifier(),
 	}
-	n.Secure = n.Subrole == SecureSubrole || (lim.RedactEditable && editable(n.Role))
+	n.Secure = e.Secure() || n.Subrole == SecureSubrole || (lim.RedactEditable && editable(n.Role))
 	if !n.Secure {
 		n.Value = e.str(strAXValue)
 	}
-	if depth >= maxDepth {
+	if depth >= maxDepth || *budget <= 0 {
 		return n, nil
 	}
 	kids, err := e.Children()
@@ -356,14 +394,17 @@ func TypeText(pid int, text string, pause time.Duration) error {
 	if err := loadElement(); err != nil {
 		return err
 	}
-	for _, u := range utf16.Encode([]rune(text)) {
+	for _, r := range text {
+		// One event per character: a character outside the BMP is two UTF-16
+		// units that must travel together.
+		units := utf16.Encode([]rune{r})
 		for _, down := range []bool{true, false} {
 			ev := cgEventCreateKeyboardEvent(0, 0, down)
 			if ev == 0 {
 				return fmt.Errorf("accessibility: CGEventCreateKeyboardEvent returned nothing")
 			}
-			c := u
-			cgEventKeyboardSetUnicode(ev, 1, &c)
+			cgEventSetFlags(ev, 0)
+			cgEventKeyboardSetUnicode(ev, uint64(len(units)), &units[0])
 			cgEventPostToPid(int32(pid), ev)
 			cfRelease(ev)
 		}
