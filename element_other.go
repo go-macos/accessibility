@@ -59,7 +59,11 @@ func (e *Element) Locate(func(*Node) bool, SnapshotLimits) ([]*Element, error) {
 func (e *Element) At(Path) (*Element, error) { return nil, ErrUnsupported }
 
 // CloseElements does nothing.
-func CloseElements([]*Element) {}
+func CloseElements(es []*Element) {
+	for _, e := range es {
+		_ = e.Close()
+	}
+}
 
 // SetValue reports [ErrUnsupported].
 func (e *Element) SetValue(string) error { return ErrUnsupported }
