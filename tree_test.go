@@ -73,3 +73,13 @@ func TestWalkPrunes(t *testing.T) {
 		t.Fatalf("walk visited %d, want 2 (root and window, pruned below)", seen)
 	}
 }
+
+func TestFindRoleMatchesValueAndDescription(t *testing.T) {
+	n := sample()
+	if got := n.FindRole("AXStaticText", "Enter password"); len(got) != 1 {
+		t.Fatalf("by value: %d", len(got))
+	}
+	if got := n.FindRole("AXButton", "confirm"); len(got) != 1 {
+		t.Fatalf("by description: %d", len(got))
+	}
+}
